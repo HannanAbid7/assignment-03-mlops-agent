@@ -1,10 +1,12 @@
 import inspect
-import json, logging, time, uuid, os
+import json, logging, re, time, uuid, os
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from openai import OpenAI
 from agent.tools import dvc_tools, mlflow_tools, airflow_tools, kubernetes_tools
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mlops_agent")
 
@@ -65,10 +67,18 @@ SYSTEM_PROMPT = (
     "Structure your final answer as: Known facts / Uncertainties / Recommendations."
 )
 
+MAX_TOOL_RESULT_CHARS = 1500
+
+def _truncate(data):
+    text = json.dumps(data)
+    if len(text) > MAX_TOOL_RESULT_CHARS:
+        return text[:MAX_TOOL_RESULT_CHARS] + "...(truncated)"
+    return data
+
 def _execute_tool(name, arguments, request_id):
     start = time.time()
     try:
-        data, status, error = TOOLS[name](**arguments), "ok", None
+        data, status, error = _truncate(TOOLS[name](**arguments)), "ok", None
     except Exception as e:
         data, status, error = None, "error", str(e)
     logger.info(json.dumps({"request_id": request_id, "tool": name, "status": status,
@@ -79,14 +89,18 @@ def handle_request(user_message: str) -> str:
     request_id = str(uuid.uuid4())
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
 
-    for _ in range(12):
-        for attempt in range(3):
+    for _ in range(16):
+        for attempt in range(5):
             try:
                 resp = llm.chat.completions.create(model=MODEL, messages=messages, tools=TOOL_SCHEMAS)
                 break
             except Exception as e:
-                if "429" in str(e) and attempt < 2:
-                    time.sleep(2 ** attempt)
+                if "429" in str(e) and attempt < 4:
+                    wait = 30
+                    match = re.search(r"try again in ([\d.]+)s", str(e))
+                    if match:
+                        wait = float(match.group(1)) + 1
+                    time.sleep(wait)
                     continue
                 raise
         choice = resp.choices[0]
@@ -100,14 +114,18 @@ def handle_request(user_message: str) -> str:
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
                 }
                 for tc in choice.message.tool_calls
             ],
         })
         for tc in choice.message.tool_calls:
-            args = json.loads(tc.function.arguments or "{}")
-            result = _execute_tool(tc.function.name, args, request_id)
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                result = {"status": "error", "data": None, "error": "invalid tool arguments (not valid JSON)"}
+            else:
+                result = _execute_tool(tc.function.name, args, request_id)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
 
     return "Reached tool-call limit without a final answer."
