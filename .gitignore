@@ -7,3 +7,5 @@ mlartifacts/
 dvc_remote/
 .dvc/cache/
 airflow_home/
+mlflow.db
+*.log
