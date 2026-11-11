@@ -36,7 +36,7 @@ def main(n_estimators=100, max_depth=None):
         mlflow.set_tag("git_commit", git_commit())
         mlflow.set_tag("dvc_data_hash", dvc_hash())
         mlflow.set_tag("dataset_version", "v1")
-        mlflow.sklearn.log_model(model, "model")
+        mlflow.sklearn.log_model(model, "model", serialization_format="pickle")
         print(f"n_estimators={n_estimators} max_depth={max_depth} acc={acc:.3f} f1={f1:.3f}")
 
 if __name__ == "__main__":
