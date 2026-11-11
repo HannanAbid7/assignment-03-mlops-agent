@@ -9,3 +9,5 @@ dvc_remote/
 airflow_home/
 mlflow.db
 *.log
+*.egg-info/
+.pytest_cache/

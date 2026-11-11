@@ -12,3 +12,6 @@ dev = ["pytest", "pytest-mock", "ruff"]
 
 [tool.setuptools]
 packages = ["agent", "agent.tools"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

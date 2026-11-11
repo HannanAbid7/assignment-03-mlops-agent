@@ -1,6 +1,0 @@
-pyproject.toml
-mlops_agent.egg-info/PKG-INFO
-mlops_agent.egg-info/SOURCES.txt
-mlops_agent.egg-info/dependency_links.txt
-mlops_agent.egg-info/requires.txt
-mlops_agent.egg-info/top_level.txt
