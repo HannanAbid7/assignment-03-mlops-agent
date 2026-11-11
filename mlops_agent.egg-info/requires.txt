@@ -1,0 +1,16 @@
+dvc
+mlflow
+scikit-learn
+pandas
+fastapi
+uvicorn
+kubernetes
+requests
+pydantic
+openai
+python-dotenv
+
+[dev]
+pytest
+pytest-mock
+ruff
