@@ -8,12 +8,16 @@ def git_commit():
     return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
 
 def dvc_hash():
-    for line in open("data/iris.csv.dvc"):
-        if "md5" in line:
-            return line.split("md5:")[1].strip()
+    try:
+        for line in open("data/iris.csv.dvc"):
+            if "md5" in line:
+                return line.split("md5:")[1].strip()
+    except FileNotFoundError:
+        pass
     return "unknown"
 
 def main(n_estimators=100, max_depth=None):
+    mlflow.set_tracking_uri("http://localhost:5000")
     mlflow.set_experiment("iris-training")
     df = pd.read_csv("data/iris.csv")
     X, y = df.drop(columns=["target"]), df["target"]
