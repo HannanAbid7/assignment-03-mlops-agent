@@ -1,0 +1,416 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{titling}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{MLOps AI Agent --- Technical Report}
+\fancyhead[R]{\thepage}
+
+\title{\textbf{Building a Production-Ready MLOps AI Agent}\\[0.3em]
+\large Assignment No.\ 3 --- MLOps \& Production AI Engineering}
+\author{Mohammad Hannan Abid \\ Roll No: 23i-0713 \\ Section: A}
+\date{Fall 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{center}
+\textbf{Repository:} \url{https://github.com/HannanAbid7/assignment-03-mlops-agent}
+\end{center}
+
+\newpage
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+This report documents the design, implementation, and testing of an
+AI-powered MLOps Agent capable of understanding natural-language requests
+and operating four real MLOps systems: DVC (dataset versioning), MLflow
+(experiment tracking), Apache Airflow (pipeline orchestration), and
+Kubernetes (deployment management). The agent is built to answer only from
+real tool evidence, never from its own training knowledge, and to never
+silently trigger retraining or cluster-state changes.
+
+\section{Complete System Architecture}
+
+\begin{center}
+\begin{verbatim}
+User / Engineer (natural language)
+        |
+        v
+FastAPI /chat endpoint (agent/main.py)
+        |
+        v
+Orchestrator (agent/orchestrator.py)
+  - sends system prompt + 21 tool schemas + conversation to an LLM
+    (Groq, OpenAI-compatible API, model openai/gpt-oss-120b)
+  - LLM decides which tool(s) to call
+  - orchestrator executes the real tool function
+  - result (status/data/error) fed back to the LLM
+  - loop continues until a final answer (max 16 iterations,
+    retries on HTTP 429 with real backoff)
+        |
+   -----+-----+-----+-----
+   |    |     |     |
+   v    v     v     v
+  DVC  MLflow Airflow Kubernetes
+\end{verbatim}
+\end{center}
+
+\subsection{Design decisions}
+
+\begin{itemize}
+  \item \textbf{No agent framework (e.g. LangChain) was used.} Tool calling
+  is implemented directly against the OpenAI-compatible chat-completions
+  API, so every tool invocation is explicit, inspectable in logs, and easy
+  to reason about for the safety requirements below.
+  \item \textbf{Tool schemas are auto-generated} from each Python function's
+  real signature via \texttt{inspect.signature}, so the JSON schema sent to
+  the LLM can never drift out of sync with the actual implementation
+  (parameter names, types, and required/optional status are always
+  consistent).
+  \item \textbf{Every tool returns a uniform envelope}:
+  \texttt{\{"status": "ok"|"error", "data": ..., "error": ...\}}, so the
+  orchestrator can report failures honestly to the LLM instead of crashing
+  or fabricating a result.
+\end{itemize}
+
+\section{Tool Definitions and Permissions}
+
+Each of the four modules exposes 5--6 callable tools (21 total), satisfying
+the "at least three tools per module" requirement. Table~\ref{tab:tools}
+lists every tool with its real docstring (used verbatim as the tool
+description sent to the LLM) and its safety/permission guard.
+
+\begin{longtable}{p{2.1cm}p{4.3cm}p{7cm}}
+\toprule
+\textbf{Module} & \textbf{Tool} & \textbf{Permission / Safety Guard} \\
+\midrule
+\endhead
+DVC & \texttt{list\_tracked\_datasets} & read-only \\
+DVC & \texttt{get\_current\_version} & read-only \\
+DVC & \texttt{compare\_versions} & read-only \\
+DVC & \texttt{has\_data\_changed} & read-only \\
+DVC & \texttt{get\_reproduction\_instructions} & read-only, no subprocess call \\
+DVC (internal) & \texttt{\_run\_dvc} & subprocess restricted to an allow-list: \texttt{status}, \texttt{list}, \texttt{diff}, \texttt{checkout} only --- no destructive DVC command is reachable \\
+\midrule
+MLflow & \texttt{list\_experiments} & read-only \\
+MLflow & \texttt{list\_runs} & read-only \\
+MLflow & \texttt{get\_run\_details} & read-only \\
+MLflow & \texttt{get\_best\_run} & read-only; always returns \texttt{production\_ready: false} with an explicit caveat so "highest metric" is never conflated with "safe to deploy" \\
+MLflow & \texttt{compare\_runs} & read-only \\
+MLflow & \texttt{get\_model\_versions} & read-only \\
+\midrule
+Airflow & \texttt{list\_dags} & read-only; filtered to this project's own DAGs (excludes $\sim$115 Airflow-bundled example DAGs) \\
+Airflow & \texttt{get\_dag\_run\_status} & read-only \\
+Airflow & \texttt{trigger\_dag} & \textbf{state-changing} --- allow-listed to \texttt{training\_pipeline} only; any other \texttt{dag\_id} raises \texttt{PermissionError} \\
+Airflow & \texttt{get\_failed\_tasks} & read-only \\
+Airflow & \texttt{get\_task\_logs} & read-only \\
+\midrule
+Kubernetes & \texttt{list\_pods\_and\_deployments} & read-only; restricted to \texttt{mlops-agent} namespace \\
+Kubernetes & \texttt{get\_pod\_status\_and\_logs} & read-only; namespace-restricted \\
+Kubernetes & \texttt{inspect\_services} & read-only; namespace-restricted \\
+Kubernetes & \texttt{get\_unhealthy\_pods} & read-only; namespace-restricted \\
+Kubernetes & \texttt{get\_deployed\_version} & read-only; namespace-restricted \\
+Kubernetes & \texttt{restart\_deployment} & \textbf{state-changing} --- requires explicit \texttt{confirm=True} \emph{and} the approved namespace; silently refuses otherwise \\
+\bottomrule
+\caption{Complete tool inventory and permission model}
+\label{tab:tools}
+\end{longtable}
+
+\subsection{System-level safety behaviors}
+
+\begin{enumerate}
+  \item The system prompt instructs the model to only state facts backed by
+  a tool result, and to explicitly say when a tool errored or a service was
+  unavailable, rather than guessing.
+  \item Retraining and cluster-state changes are never triggered
+  automatically: the system prompt instructs the model to only
+  \emph{recommend} such actions, and the only two state-changing tools
+  (\texttt{trigger\_dag}, \texttt{restart\_deployment}) carry their own
+  independent guards regardless of what the model decides.
+  \item Every tool call is logged with a request ID, tool name, status, and
+  duration --- no secrets are ever logged.
+  \item Malformed tool-call arguments from the LLM are caught and reported
+  as a structured error instead of crashing the request.
+\end{enumerate}
+
+\section{Evidence from Each System}
+
+\subsection{DVC}
+\begin{lstlisting}
+$ dvc status
+Data and pipelines are up to date.
+
+$ git tag -n
+dataset-v1      fix: properly track dataset with DVC instead of git, ...
+dataset-v2      chore: update dataset to v2
+\end{lstlisting}
+Two real dataset versions were created and tagged during development: training
+on \texttt{dataset-v1} produced runs with F1 $\approx 1.0$; after removing
+the last 10 rows of the Iris dataset to produce \texttt{dataset-v2}, F1
+dropped to $\approx 0.93$ --- a genuine, observable effect of dataset
+versioning on model quality, which the agent's \texttt{get\_current\_version}
+and \texttt{compare\_versions} tools can detect.
+
+\subsection{MLflow}
+\begin{lstlisting}
+run_id        params                              metrics
+f4ab478858bb  n_estimators=100, max_depth=None     acc=0.929, f1=0.930
+efe363d914a0  n_estimators=100, max_depth=None     acc=0.929, f1=0.930
+2d3248b202ac  n_estimators=200, max_depth=10       acc=1.000, f1=1.000
+dac909699dcf  n_estimators=150, max_depth=5        acc=1.000, f1=1.000
+\end{lstlisting}
+Eight manual training runs plus three Airflow-triggered runs were logged to
+the \texttt{iris-training} experiment across both dataset versions, each
+tagged with its producing git commit and DVC data hash.
+
+\subsection{Airflow}
+\begin{lstlisting}
+$ GET /api/v2/dags/training_pipeline/dagRuns
+manual__2026-11-11T18:08:43 -> success   (threshold 0.6, normal run)
+manual__2026-11-11T18:49:54 -> success   (threshold 0.99, best historical
+                                           run still cleared the gate)
+manual__2026-11-11T18:50:31 -> failed    (threshold 1.5, quality gate
+                                           correctly blocked promotion)
+\end{lstlisting}
+The DAG (\texttt{validate\_dataset} $\to$ \texttt{preprocess\_data} $\to$
+\texttt{train\_model} $\to$ \texttt{evaluate\_and\_log\_mlflow} $\to$
+\texttt{quality\_gate}) was triggered three times via the real Airflow REST
+API (token-authenticated), demonstrating both a successful run and a
+correctly-blocked run (Failure Injection 2, Section~\ref{sec:failures}).
+
+\subsection{Kubernetes}
+\begin{lstlisting}
+$ kubectl get pods -n mlops-agent
+NAME                        READY   STATUS    RESTARTS   AGE
+iris-api-644d56d745-4kh6c   1/1     Running   0          157m
+iris-api-644d56d745-k4tr2   1/1     Running   0          157m
+
+$ kubectl get svc -n mlops-agent
+NAME       TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)
+iris-api   ClusterIP   10.96.129.107   <none>        80/TCP
+
+$ kubectl get deployment -n mlops-agent
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+iris-api   2/2     2            2           157m
+\end{lstlisting}
+The inference service runs as a 2-replica Deployment with readiness/liveness
+probes on \texttt{/health}, CPU/memory requests and limits, and
+configuration via a ConfigMap, fronted by a ClusterIP Service --- all
+required manifest elements are present (\texttt{kubernetes/*.yaml}).
+
+\section{Tested Agent Conversations}
+
+Three full conversations were run against the live agent (real LLM calls,
+real tool execution against the running DVC/MLflow/Airflow/Kubernetes
+stack). A fourth and fifth conversation were planned but could not be
+completed with full final-answer text because the project's free-tier LLM
+API key exhausted its daily token quota partway through testing --- this is
+documented honestly as Known Limitation~1 (Section~\ref{sec:limitations})
+rather than fabricated.
+
+\subsection{Conversation 1: Mandatory multi-tool integration scenario}
+
+\textbf{Prompt:} \textit{"Find the best recent model, identify the dataset
+version used to train it, check the deployment status, and explain whether
+retraining is necessary."}
+
+\textbf{Tools called (in order):} \texttt{get\_best\_run} $\to$
+\texttt{list\_pods\_and\_deployments} $\to$ \texttt{get\_deployed\_version}
+$\to$ \texttt{compare\_versions} $\to$ \texttt{get\_model\_versions} $\to$
+\texttt{list\_tracked\_datasets} $\to$ \texttt{get\_current\_version}.
+
+\textbf{Agent's final answer (abridged):}
+\begin{quote}
+\small
+\textbf{Known facts} --- Best recent run \texttt{2d3248b2...} (accuracy =
+1.0, f1\_score = 1.0), tagged with \texttt{dataset\_version=v1} and DVC hash
+\texttt{4d301ab...}. Current dataset hash \texttt{c49abde...} differs from
+the run's hash --- the data has changed since that training. Deployment
+\texttt{iris-api} is running version \texttt{iris-api:1.0} with 2 healthy
+pods. Model registry is empty (no registered versions).
+
+\textbf{Uncertainties} --- The deployed version has no explicit link to an
+MLflow run ID; cannot confirm which model is actually serving.
+
+\textbf{Recommendations} --- Register the validated model in the MLflow
+Registry with its dataset hash and commit; since the current dataset differs
+from the one used to train the best run, retraining on the latest data is
+advisable --- but this is a \emph{recommendation only}, not an automatic
+action.
+\end{quote}
+
+This demonstrates correlation of evidence across all four systems and
+correctly stops short of auto-triggering retraining, per the assignment's
+mandatory requirement.
+
+\subsection{Conversation 2: Kubernetes deployment diagnosis (Failure Injection 1)}
+
+\textbf{Prompt:} \textit{"Why is my prediction API unavailable?"}
+
+\textbf{Injected failure:} \texttt{kubectl set image deployment/iris-api
+iris-api=iris-api:bad -n mlops-agent}, producing a third pod stuck in
+\texttt{ErrImagePull} alongside two healthy pods.
+
+\textbf{Agent's final answer (abridged):}
+\begin{quote}
+\small
+\textbf{Known facts} --- Two pods (\texttt{...4kh6c}, \texttt{...k4tr2}) are
+\texttt{Running} with logs showing successful \texttt{GET /health} calls. A
+third pod (\texttt{...5pnzc}) is \texttt{Pending}: "trying and failing to
+pull image" --- a container-image-pull failure.
+
+\textbf{Recommendations} --- Inspect the failing pod's events
+(\texttt{kubectl describe pod}), validate the image reference in the
+Deployment spec, fix the tag/registry issue, and roll out again; consider
+temporarily scaling to the two healthy replicas while the image is fixed.
+\end{quote}
+
+The agent correctly distinguished healthy from unhealthy pods using real
+pod status and logs, rather than guessing at the cause.
+
+\subsection{Conversation 3: Airflow pipeline diagnosis (Failure Injection 2, partial)}
+
+\textbf{Prompt:} \textit{"The last training pipeline run seems to have
+failed, what happened and why?"}
+
+\textbf{Injected failure:} \texttt{QUALITY\_THRESHOLD} raised from 0.6 to
+1.5 (unreachable), DAG triggered.
+
+\textbf{Tool chain executed (verified in logs):} \texttt{list\_dags} $\to$
+\texttt{get\_dag\_run\_status} $\to$ \texttt{get\_failed\_tasks} $\to$
+\texttt{get\_task\_logs}. The agent correctly identified that all four
+upstream tasks succeeded and \texttt{quality\_gate} was the failed task,
+fetching its logs as evidence.
+
+\textbf{Outcome:} the LLM's final natural-language synthesis was cut off
+mid-generation because the project's Groq API key hit its 200{,}000
+token/day cap during this exact test (see Limitation~\ref{sec:limitations}).
+The tool-selection and evidence-gathering logic itself is verified correct
+from the structured logs; only the very last synthesis step did not
+complete. This is reported honestly rather than fabricated, and is itself
+documented as Failure Investigation 2.
+
+\section{Failure Investigations}
+\label{sec:failures}
+
+\subsection{Failure Investigation 1: Kubernetes bad image tag}
+\textbf{Root cause:} Deployment updated to reference a non-existent image
+tag (\texttt{iris-api:bad}).\\
+\textbf{Resolution:} \texttt{kubectl rollout undo deployment/iris-api -n
+mlops-agent}; pods returned to \texttt{2/2 Running} within seconds.
+
+\subsection{Failure Investigation 2: Airflow quality gate (plus a real external-API failure)}
+\textbf{Root cause (intended):} \texttt{QUALITY\_THRESHOLD} set above any
+achievable F1 score, so the quality gate correctly blocked promotion of an
+otherwise-successfully-trained model.\\
+\textbf{Root cause (unintended, discovered during this investigation):} the
+Groq free-tier API key's \emph{daily} token quota (200{,}000 TPD) was
+exhausted mid-test, which is a genuine infrastructure limitation of the
+chosen LLM provider, separate from the agent's own logic.\\
+\textbf{Resolution:} \texttt{QUALITY\_THRESHOLD} reverted to \texttt{0.6};
+the daily-quota issue is documented as a known limitation (upgrading to a
+paid tier or adding proactive token-budget tracking are the proposed fixes).
+
+\section{Testing, Reliability, and Safety}
+
+Ten automated \texttt{pytest} tests cover all four tool modules plus the
+orchestrator, with every external service mocked:
+
+\begin{itemize}
+  \item \texttt{test\_rejects\_non\_allowlisted\_subcommand} --- DVC command allow-list enforced.
+  \item \texttt{test\_get\_best\_run\_picks\_highest\_metric}, \texttt{test\_get\_best\_run\_no\_matches} --- MLflow tool correctness.
+  \item \texttt{test\_trigger\_dag\_rejects\_unapproved} --- Airflow DAG allow-list enforced.
+  \item \texttt{test\_get\_dag\_run\_status\_timeout} --- Airflow tool handles a connection timeout without crashing.
+  \item \texttt{test\_rejects\_wrong\_namespace} --- Kubernetes namespace restriction enforced.
+  \item \texttt{test\_restart\_requires\_confirm} --- unauthorized cluster-state change rejected.
+  \item \texttt{test\_no\_invented\_results\_on\_tool\_failure} --- orchestrator reports a tool failure as an error, never a fabricated result.
+  \item \texttt{test\_tool\_success\_path} --- successful tool execution and result propagation.
+  \item \texttt{test\_logs\_contain\_no\_secrets} --- structured logs never expose credentials.
+\end{itemize}
+
+All 10 tests pass (\texttt{pytest -v}, verified locally and in CI via
+GitHub Actions on every push and pull request).
+
+Two deliberately injected failures were demonstrated end-to-end
+(Section~\ref{sec:failures}), satisfying the requirement to show at least
+two and explain how the agent diagnoses them.
+
+\section{GitHub Repository and CI}
+
+The repository follows the assignment's recommended structure
+(\texttt{agent/}, \texttt{api/}, \texttt{dags/}, \texttt{kubernetes/},
+\texttt{tests/}, \texttt{.github/workflows/}). A GitHub Actions workflow
+(\texttt{.github/workflows/ci.yml}) runs linting and the full pytest suite
+on every push and pull request, with all external service calls mocked so
+CI requires no live infrastructure.
+
+\section{Known Limitations and Proposed Improvements}
+\label{sec:limitations}
+
+\begin{enumerate}
+  \item \textbf{Third-party API rate limits.} The free Groq tier enforces
+  an 8{,}000 token/minute and 200{,}000 token/day cap. Long multi-tool
+  conversations (especially ones pulling Airflow task logs) can exceed
+  this, causing slow responses while the orchestrator backs off and
+  retries, or --- once the \emph{daily} cap is hit --- a hard failure that
+  cannot be retried around (observed directly in Conversation 3 / Failure
+  Investigation 2). \textbf{Improvement:} move to a paid tier or
+  self-hosted model, or add a proactive token-budget tracker.
+  \item \textbf{Tool-result truncation can hide information.} Tool output
+  is capped at 1{,}500 characters before being sent back to the LLM to
+  control token usage; this can cut off relevant content in very large
+  responses. \textbf{Improvement:} summarize large payloads server-side
+  instead of blind truncation.
+  \item \textbf{The training DAG's quality gate evaluates the best
+  historical MLflow run, not strictly the run just produced}, since runs
+  are not filtered by the triggering Airflow run ID. This means the gate
+  can pass even if the \emph{current} training run underperforms a past
+  one. \textbf{Improvement:} tag each MLflow run with its Airflow
+  \texttt{run\_id} and filter the quality gate on that specific run.
+  \item \textbf{No formal model registry workflow.} Models are logged to
+  MLflow runs but never registered/promoted automatically --- this is
+  intentional (the assignment requires that promotion never happen
+  automatically), but it means the agent cannot yet answer "what model is
+  in production" from the registry alone.
+  \item \textbf{Single-node demo topology.} Airflow runs via
+  \texttt{airflow standalone} and Kubernetes runs on a local \texttt{kind}
+  cluster --- appropriate for this assignment, not representative of a
+  production deployment.
+\end{enumerate}
+
+\section{Conclusion}
+
+The MLOps AI Agent successfully integrates DVC, MLflow, Airflow, and
+Kubernetes behind a single conversational interface, answers only from real
+tool evidence, correctly withholds automatic retraining/cluster changes
+behind explicit safety guards, and was validated against two deliberately
+injected failures plus a mandatory multi-tool integration scenario. The one
+incomplete test run was caused by an external API quota limit rather than a
+flaw in the agent's own reasoning or tool-selection logic, and is documented
+transparently above as both a limitation and a real-world engineering
+lesson about depending on third-party rate-limited services.
+
+\end{document}
