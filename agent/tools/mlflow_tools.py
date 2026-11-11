@@ -1,21 +1,25 @@
-from numpy import exp
-
+"""MLflow experiment/run inspection tools via MlflowClient."""
 from mlflow.tracking import MlflowClient
 client = MlflowClient(tracking_uri="http://localhost:5000")
 
 def list_experiments():
+    """List all MLflow experiments."""
     return [{"id": e.experiment_id, "name": e.name} for e in client.search_experiments()]
 
 def list_runs(experiment_name: str = "iris-training", max_results: int = 20):
+    """List runs for an experiment with params and metrics."""
     exp = client.get_experiment_by_name(experiment_name)
     runs = client.search_runs([exp.experiment_id], max_results=max_results)
     return [{"run_id": r.info.run_id, "params": r.data.params, "metrics": r.data.metrics} for r in runs]
 
 def get_run_details(run_id: str):
+    """Get full params, metrics, and artifact URI for one run."""
     r = client.get_run(run_id)
     return {"params": r.data.params, "metrics": r.data.metrics, "tags": r.data.tags, "artifact_uri": r.info.artifact_uri}
 
 def get_best_run(metric_name: str = "f1_score", experiment_name: str = "iris-training", mode: str = "max"):
+    """Find the best run by a metric. Does not imply production-readiness."""
+    exp = client.get_experiment_by_name(experiment_name)
     runs = [r for r in client.search_runs([exp.experiment_id]) if metric_name in r.data.metrics]
     if not runs:
         return {"error": f"no runs with metric {metric_name}"}
@@ -27,9 +31,11 @@ def get_best_run(metric_name: str = "f1_score", experiment_name: str = "iris-tra
     }
 
 def compare_runs(run_ids: list[str]):
+    """Compare metrics/params across multiple runs."""
     return [get_run_details(r) for r in run_ids]
 
 def get_model_versions(model_name: str = "iris-model"):
+    """List registered model versions, if any exist."""
     try:
         return [{"version": v.version, "stage": v.current_stage} for v in client.search_model_versions(f"name='{model_name}'")]
     except Exception:

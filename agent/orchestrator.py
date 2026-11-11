@@ -1,3 +1,4 @@
+import inspect
 import json, logging, time, uuid, os
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -35,10 +36,24 @@ TOOLS = {
     "restart_deployment": kubernetes_tools.restart_deployment,
 }
 
+_TYPE_MAP = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array"}
+
 def _schema(name, fn):
+    sig = inspect.signature(fn)
+    properties, required = {}, []
+    for pname, param in sig.parameters.items():
+        annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
+        base = getattr(annotation, "__origin__", annotation)
+        json_type = _TYPE_MAP.get(base, "string")
+        prop = {"type": json_type}
+        if json_type == "array":
+            prop["items"] = {"type": "string"}
+        properties[pname] = prop
+        if param.default is inspect.Parameter.empty:
+            required.append(pname)
     return {"type": "function", "function": {
         "name": name, "description": (fn.__doc__ or name).strip(),
-        "parameters": {"type": "object", "properties": {}},
+        "parameters": {"type": "object", "properties": properties, "required": required},
     }}
 
 TOOL_SCHEMAS = [_schema(n, f) for n, f in TOOLS.items()]
@@ -64,7 +79,7 @@ def handle_request(user_message: str) -> str:
     request_id = str(uuid.uuid4())
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
 
-    for _ in range(8):
+    for _ in range(12):
         for attempt in range(3):
             try:
                 resp = llm.chat.completions.create(model=MODEL, messages=messages, tools=TOOL_SCHEMAS)
@@ -78,7 +93,18 @@ def handle_request(user_message: str) -> str:
         if not choice.message.tool_calls:
             return choice.message.content
 
-        messages.append(choice.message.model_dump())
+        messages.append({
+            "role": "assistant",
+            "content": choice.message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in choice.message.tool_calls
+            ],
+        })
         for tc in choice.message.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
             result = _execute_tool(tc.function.name, args, request_id)
